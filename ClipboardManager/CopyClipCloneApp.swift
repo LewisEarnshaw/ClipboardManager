@@ -6,7 +6,9 @@ struct CopyClipCloneApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        // No visible window — the app lives entirely in the menu bar.
-        Settings { EmptyView() }
+        // The Settings scene renders as the standard Preferences window (⌘,).
+        Settings {
+            PreferencesView()
+        }
     }
 }

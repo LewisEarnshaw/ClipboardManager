@@ -1,39 +1,52 @@
 import AppKit
 import Combine
 
-/// A single saved clip.
+/// What a clip holds.
+enum ClipKind: String, Codable {
+    case text
+    case image
+    case file
+}
+
+/// A single saved clip (text, image, or a file reference).
 struct ClipItem: Identifiable, Codable, Equatable {
     let id: UUID
-    let text: String
+    let kind: ClipKind
+    let text: String            // .text -> content; .file -> full path; .image -> ""
+    let imageFileName: String?  // .image -> PNG filename saved on disk
     let date: Date
     var isPinned: Bool
 
-    init(text: String, isPinned: Bool = false) {
+    init(kind: ClipKind, text: String = "", imageFileName: String? = nil, isPinned: Bool = false) {
         self.id = UUID()
+        self.kind = kind
         self.text = text
+        self.imageFileName = imageFileName
         self.date = Date()
         self.isPinned = isPinned
     }
 
-    // Custom decode so history saved by older versions (no isPinned) still loads.
-    enum CodingKeys: String, CodingKey { case id, text, date, isPinned }
+    // Migration-friendly decode: older saved clips only had text/date/isPinned.
+    enum CodingKeys: String, CodingKey { case id, kind, text, imageFileName, date, isPinned }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         text = try c.decode(String.self, forKey: .text)
         date = try c.decode(Date.self, forKey: .date)
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        kind = try c.decodeIfPresent(ClipKind.self, forKey: .kind) ?? .text
+        imageFileName = try c.decodeIfPresent(String.self, forKey: .imageFileName)
     }
 }
 
-/// Watches the system pasteboard and keeps a de-duplicated history of copied text.
+/// Watches the system pasteboard and keeps a de-duplicated history of clips.
 final class ClipboardManager: ObservableObject {
     @Published private(set) var history: [ClipItem] = []
 
     private let pasteboard = NSPasteboard.general
     private var lastChangeCount: Int
     private var timer: Timer?
-    private let maxItems: Int
+    private var maxItems: Int
     private let storageKey = "clipboard_history"
 
     // Types other apps use to say "don't store this" (passwords, transient values).
@@ -48,6 +61,15 @@ final class ClipboardManager: ObservableObject {
         self.lastChangeCount = pasteboard.changeCount
         load()
         startMonitoring()
+    }
+
+    // Where saved images live: ~/Library/Application Support/CopyClipClone/Images
+    private var imagesDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("CopyClipClone/Images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     // macOS has no "pasteboard changed" notification, so we poll changeCount.
@@ -65,61 +87,139 @@ final class ClipboardManager: ObservableObject {
         let currentTypes = pasteboard.types ?? []
         if concealedTypes.contains(where: { currentTypes.contains($0) }) { return }
 
-        guard let text = pasteboard.string(forType: .string),
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        addItem(text)
+        // 1) Files copied from Finder (file URLs only — not web links).
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                                             options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let first = urls.first {
+            addFile(path: first.path)
+            return
+        }
+
+        // 2) Plain text.
+        if let text = pasteboard.string(forType: .string),
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            addText(text)
+            return
+        }
+
+        // 3) Image (screenshots, copied pictures).
+        if let image = NSImage(pasteboard: pasteboard) {
+            addImage(image)
+            return
+        }
     }
 
-    private func addItem(_ text: String) {
-        // If the same text exists, move it to the top but keep its pinned state.
-        if let existing = history.first(where: { $0.text == text }) {
-            history.removeAll { $0.text == text }
+    // MARK: - Adding clips
+
+    private func addText(_ text: String) {
+        moveOrInsert(matching: { $0.kind == .text && $0.text == text },
+                     makeNew: { ClipItem(kind: .text, text: text) })
+    }
+
+    private func addFile(path: String) {
+        moveOrInsert(matching: { $0.kind == .file && $0.text == path },
+                     makeNew: { ClipItem(kind: .file, text: path) })
+    }
+
+    private func addImage(_ image: NSImage) {
+        guard let data = image.pngData() else { return }
+        let fileName = UUID().uuidString + ".png"
+        do {
+            try data.write(to: imagesDirectory.appendingPathComponent(fileName))
+        } catch {
+            print("Failed to save image: \(error.localizedDescription)")
+            return
+        }
+        history.insert(ClipItem(kind: .image, imageFileName: fileName), at: 0)
+        trim(); save()
+    }
+
+    /// If an identical clip exists, bump it to the top; otherwise insert a new one.
+    private func moveOrInsert(matching: (ClipItem) -> Bool, makeNew: () -> ClipItem) {
+        if let existing = history.first(where: matching) {
+            history.removeAll { $0.id == existing.id }
             history.insert(existing, at: 0)
         } else {
-            history.insert(ClipItem(text: text), at: 0)
+            history.insert(makeNew(), at: 0)
         }
-        trim()
-        save()
+        trim(); save()
     }
 
-    /// Keep all pinned clips plus the most recent unpinned ones up to maxItems.
-    private func trim() {
-        let pinnedCount = history.filter { $0.isPinned }.count
-        let allowedUnpinned = max(0, maxItems - pinnedCount)
-        var unpinnedSeen = 0
-        history = history.filter { item in
-            if item.isPinned { return true }
-            unpinnedSeen += 1
-            return unpinnedSeen <= allowedUnpinned
-        }
+    // MARK: - Reading images for display
+
+    func image(for item: ClipItem) -> NSImage? {
+        guard item.kind == .image, let name = item.imageFileName else { return nil }
+        return NSImage(contentsOf: imagesDirectory.appendingPathComponent(name))
     }
+
+    // MARK: - Actions
 
     /// Writes a clip back to the system clipboard so the user can paste it.
     func copyToClipboard(_ item: ClipItem) {
         pasteboard.clearContents()
-        pasteboard.setString(item.text, forType: .string)
+        switch item.kind {
+        case .text:
+            pasteboard.setString(item.text, forType: .string)
+        case .file:
+            pasteboard.writeObjects([URL(fileURLWithPath: item.text) as NSURL])
+        case .image:
+            if let name = item.imageFileName,
+               let img = NSImage(contentsOf: imagesDirectory.appendingPathComponent(name)) {
+                pasteboard.writeObjects([img])
+            }
+        }
         lastChangeCount = pasteboard.changeCount     // don't re-capture our own write
+    }
+
+    /// Called when the user changes history size in Preferences.
+    func updateMaxItems(_ value: Int) {
+        maxItems = value
+        trim(); save()
     }
 
     func togglePin(_ item: ClipItem) {
         guard let idx = history.firstIndex(where: { $0.id == item.id }) else { return }
         history[idx].isPinned.toggle()
-        trim()
-        save()
+        trim(); save()
     }
 
     func delete(_ item: ClipItem) {
+        deleteImageFile(item)
         history.removeAll { $0.id == item.id }
         save()
     }
 
     /// Clears everything except pinned clips.
     func clearHistory() {
+        history.filter { !$0.isPinned }.forEach(deleteImageFile)
         history.removeAll { !$0.isPinned }
         save()
     }
 
-    // MARK: - Persistence (UserDefaults)
+    // MARK: - Trimming & cleanup
+
+    /// Keep all pinned clips plus the most recent unpinned ones up to maxItems.
+    private func trim() {
+        let pinnedCount = history.filter { $0.isPinned }.count
+        let allowedUnpinned = max(0, maxItems - pinnedCount)
+        var unpinnedSeen = 0
+        var kept: [ClipItem] = []
+        var removed: [ClipItem] = []
+        for item in history {
+            if item.isPinned { kept.append(item); continue }
+            unpinnedSeen += 1
+            if unpinnedSeen <= allowedUnpinned { kept.append(item) } else { removed.append(item) }
+        }
+        history = kept
+        removed.forEach(deleteImageFile)   // don't leave orphaned image files on disk
+    }
+
+    private func deleteImageFile(_ item: ClipItem) {
+        guard item.kind == .image, let name = item.imageFileName else { return }
+        try? FileManager.default.removeItem(at: imagesDirectory.appendingPathComponent(name))
+    }
+
+    // MARK: - Persistence (UserDefaults holds the list; images live on disk)
 
     private func save() {
         if let data = try? JSONEncoder().encode(history) {
@@ -131,5 +231,15 @@ final class ClipboardManager: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([ClipItem].self, from: data) else { return }
         history = decoded
+    }
+}
+
+// MARK: - NSImage -> PNG helper
+
+extension NSImage {
+    func pngData() -> Data? {
+        guard let tiff = tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
     }
 }
